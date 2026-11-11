@@ -1,0 +1,334 @@
+import React, { useState, useEffect } from 'react';
+import { useUser } from '../services/userContext';
+import { useTranslation } from '../App';
+import { breweryService } from '../services/breweryService';
+import { Brewery, Invitation, BreweryRole, UserProfile } from '../types';
+
+const BrewerySettings: React.FC = () => {
+  const { profile, user, breweryRole } = useUser();
+  const { t } = useTranslation();
+  const roleLabel = (role?: string | null) => (role ? t(`role_${role}` as any) : '');
+  const [brewery, setBrewery] = useState<Brewery | null>(null);
+  const [members, setMembers] = useState<any[]>([]);
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newName, setNewName] = useState('');
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [inviteRole, setInviteRole] = useState<BreweryRole>('brewmaster');
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [sendingInvite, setSendingInvite] = useState(false);
+  const [joinCode, setJoinCode] = useState('');
+  const [joining, setJoining] = useState(false);
+
+  const isAdmin = breweryRole === 'admin';
+
+  useEffect(() => {
+    if (profile?.brewery_id) {
+      loadData();
+    }
+  }, [profile?.brewery_id]);
+
+  const loadData = async () => {
+    if (!profile?.brewery_id) return;
+    setLoading(true);
+    try {
+      const b = await breweryService.getBrewery(profile.brewery_id);
+      setBrewery(b);
+      if (b) setNewName(b.name);
+
+      const m = await breweryService.getMembers(profile.brewery_id);
+      setMembers(m);
+
+      if (isAdmin) {
+        const i = await breweryService.getInvitations(profile.brewery_id);
+        setInvitations(i);
+      }
+    } catch (err) {
+      console.error('Error loading brewery data:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpdateName = async () => {
+    if (!brewery || !newName.trim()) return;
+    try {
+      await breweryService.updateBrewery(brewery.id, newName);
+      setBrewery({ ...brewery, name: newName });
+      alert(t('brewery_name_updated'));
+    } catch (err) {
+      alert(t('brewery_name_update_failed'));
+    }
+  };
+
+  const handleCreateInvite = async () => {
+    if (!profile?.brewery_id || !inviteEmail.trim()) {
+      alert(t('invite_email_required'));
+      return;
+    }
+
+    setSendingInvite(true);
+    try {
+      const invite = await breweryService.generateInvitation(profile.brewery_id, inviteRole, inviteEmail.trim());
+      if (invite) {
+        // Send email via API (server checks you are admin of this brewery)
+        await breweryService.sendInviteEmail(invite.id);
+
+        setInvitations([...invitations, invite]);
+        setShowInviteModal(false);
+        setInviteEmail('');
+        alert(t('invite_sent'));
+      }
+    } catch (err: any) {
+      alert(`${t('error_prefix')}: ${err.message}`);
+    } finally {
+      setSendingInvite(false);
+    }
+  };
+
+  const handleDeleteInvite = async (id: string) => {
+    try {
+      await breweryService.deleteInvitation(id);
+      setInvitations(invitations.filter(i => i.id !== id));
+    } catch (err) {
+      alert(t('delete_invite_failed'));
+    }
+  };
+
+  const handleRemoveMember = async (id: string) => {
+    if (!confirm(t('confirm_remove_member'))) return;
+    try {
+      await breweryService.removeMember(id);
+      setMembers(members.filter(m => m.id !== id));
+    } catch (err) {
+      alert(t('remove_member_failed'));
+    }
+  };
+
+  const handleJoinBrewery = async () => {
+    const code = joinCode.trim();
+    if (!code || !confirm(t('join_brewery_confirm' as any))) return;
+    setJoining(true);
+    try {
+      await breweryService.joinBrewery(code);
+      // Brewery, realtime channels and data all change: reload the app
+      window.location.reload();
+    } catch (err: any) {
+      alert(`${t('join_brewery_failed' as any)}: ${err.message}`);
+      setJoining(false);
+    }
+  };
+
+  if (loading) return <div className="py-12 text-center text-stone-400 font-bold uppercase tracking-widest text-xs animate-pulse">{t('team_loading')}</div>;
+
+  return (
+    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-8">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-amber-500 p-3 rounded-2xl text-white shadow-lg">
+              <i className="fas fa-beer-mug-empty text-2xl"></i>
+            </div>
+            <div>
+              <h3 className="text-2xl font-black text-stone-900">{brewery?.name || t('my_brewery')}</h3>
+              <p className="text-[10px] font-black text-stone-400 uppercase tracking-widest">
+                {t('role_label')}: <span className="text-amber-600">{roleLabel(breweryRole)}</span>
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {isAdmin && (
+          <div className="space-y-4 pt-4 border-t border-stone-100">
+            <label htmlFor="brewery-name-input" className="text-[10px] font-black text-stone-400 uppercase tracking-widest">{t('brewery_name_label')}</label>
+            <div className="flex gap-2">
+              <input
+                id="brewery-name-input"
+                name="brewery_name"
+                type="text"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                className="flex-1 px-4 py-3 bg-stone-50 border border-stone-200 rounded-xl font-bold focus:ring-2 focus:ring-amber-500/20 outline-none"
+                maxLength={100}
+              />
+              <button
+                onClick={handleUpdateName}
+                className="px-6 py-3 bg-stone-900 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-black transition-all"
+              >
+                {t('save_btn')}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {/* Members List */}
+        <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-6">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="bg-blue-100 p-2 rounded-xl text-blue-600">
+              <i className="fas fa-users"></i>
+            </div>
+            <h4 className="text-lg font-black text-stone-900">{t('team_members')}</h4>
+          </div>
+          <div className="space-y-3">
+            {members.map(member => (
+              <div key={member.id} className="flex items-center justify-between p-4 bg-stone-50 rounded-2xl border border-stone-100">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-stone-200 rounded-full flex items-center justify-center text-stone-500">
+                    <i className="fas fa-user text-xs"></i>
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-stone-900 truncate max-w-[150px]">
+                      {member.id === profile?.id ? t('team_you') : member.email || member.id.substring(0, 8) + '...'}
+                    </p>
+                    <p className="text-[9px] font-black text-stone-400 uppercase tracking-widest">{roleLabel(member.brewery_role)}</p>
+                  </div>
+                </div>
+                {isAdmin && member.id !== profile?.id && (
+                  <button onClick={() => handleRemoveMember(member.id)} className="text-stone-300 hover:text-red-500 transition-colors" aria-label={t('remove_member')} title={t('remove_member')}>
+                    <i className="fas fa-user-minus" aria-hidden="true"></i>
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Invitations */}
+        {isAdmin && (
+          <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-6">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                <div className="bg-green-100 p-2 rounded-xl text-green-600">
+                  <i className="fas fa-envelope-open-text"></i>
+                </div>
+                <h4 className="text-lg font-black text-stone-900">{t('active_invites')}</h4>
+              </div>
+              <button
+                onClick={() => setShowInviteModal(true)}
+                className="w-8 h-8 bg-stone-900 text-white rounded-lg flex items-center justify-center hover:bg-black transition-all"
+                aria-label={t('new_invite')}
+                title={t('new_invite')}
+              >
+                <i className="fas fa-plus" aria-hidden="true"></i>
+              </button>
+            </div>
+            <div className="space-y-3">
+              {invitations.length === 0 && (
+                <p className="text-center py-8 text-xs text-stone-400 font-bold italic">{t('no_active_invites')}</p>
+              )}
+              {invitations.map(invite => (
+                <div key={invite.id} className="p-4 bg-stone-50 rounded-2xl border border-stone-100 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                        <span className="text-[10px] font-black text-stone-400 uppercase tracking-widest block">{t('role_label')}: {roleLabel(invite.role)}</span>
+                        {invite.email && <span className="text-[10px] font-bold text-amber-600 block">{invite.email}</span>}
+                    </div>
+                    <button onClick={() => handleDeleteInvite(invite.id)} className="text-stone-300 hover:text-red-500 transition-colors text-xs" aria-label={t('delete_invite')} title={t('delete_invite')}>
+                      <i className="fas fa-trash-alt" aria-hidden="true"></i>
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between bg-white p-3 rounded-xl border border-stone-200">
+                    <code className="text-sm font-black text-amber-600">{invite.code}</code>
+                    <button
+                      onClick={() => { navigator.clipboard.writeText(invite.code); alert(t('code_copied')); }}
+                      className="text-[10px] font-black uppercase text-stone-400 hover:text-stone-900"
+                    >
+                      {t('copy_btn')}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-4">
+        <div>
+          <h4 className="text-sm font-black text-stone-900 uppercase tracking-widest">{t('join_brewery_title' as any)}</h4>
+          <p className="text-xs text-stone-500 font-medium mt-1">{t('join_brewery_desc' as any)}</p>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-3">
+          <label htmlFor="join-brewery-code" className="sr-only">{t('auth_invite_code_label' as any)}</label>
+          <input
+            id="join-brewery-code"
+            name="join-brewery-code"
+            type="text"
+            maxLength={20}
+            value={joinCode}
+            onChange={e => setJoinCode(e.target.value.toUpperCase())}
+            placeholder="ABCD2345"
+            className="flex-1 px-4 py-3 bg-stone-50 border border-stone-200 rounded-xl font-bold uppercase tracking-widest outline-none focus:ring-2 focus:ring-amber-500/20"
+          />
+          <button
+            onClick={handleJoinBrewery}
+            disabled={joining || !joinCode.trim()}
+            className="px-6 py-3 bg-stone-900 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-black transition-all disabled:opacity-50"
+          >
+            {joining ? <i className="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i> : null}
+            {t('join_brewery_btn' as any)}
+          </button>
+        </div>
+      </div>
+
+      {showInviteModal && (
+        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
+          <div className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl animate-in zoom-in-95">
+            <h3 className="text-2xl font-black text-stone-900 mb-6">{t('create_invite_title')}</h3>
+            <div className="space-y-4">
+              <div>
+              <label htmlFor="invite-email" className="block text-[10px] font-black text-stone-400 uppercase mb-2 ml-1">{t('auth_email_label')}</label>
+                <input
+                id="invite-email"
+                name="email"
+                  type="email"
+                  value={inviteEmail}
+                  onChange={(e) => setInviteEmail(e.target.value)}
+                  placeholder="brewmaster@example.com"
+                  className="w-full px-4 py-3 bg-stone-50 border border-stone-200 rounded-xl font-bold focus:ring-2 focus:ring-amber-500/20 outline-none mb-4"
+                maxLength={255}
+                />
+
+              <label id="invite-role-label" className="block text-[10px] font-black text-stone-400 uppercase mb-2 ml-1">{t('assign_role')}</label>
+                <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-labelledby="invite-role-label">
+                  {(['brewmaster', 'brewer', 'taster'] as BreweryRole[]).map(role => (
+                    <button
+                      key={role}
+                      type="button"
+                      role="radio"
+                      aria-checked={inviteRole === role}
+                      onClick={() => setInviteRole(role)}
+                      className={`p-3 rounded-xl border-2 text-[10px] font-black uppercase tracking-widest transition-all ${inviteRole === role ? 'bg-amber-50 border-amber-500 text-amber-600' : 'bg-white border-stone-100 text-stone-400'}`}
+                    >
+                      {roleLabel(role)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="pt-4 flex gap-3">
+                <button
+                  onClick={() => setShowInviteModal(false)}
+                  className="flex-1 py-3 bg-stone-100 text-stone-600 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-stone-200 transition-all"
+                >
+                  {t('cancel_btn')}
+                </button>
+                <button
+                  onClick={handleCreateInvite}
+                  disabled={sendingInvite}
+                  className="flex-1 py-3 bg-stone-900 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-black transition-all shadow-lg shadow-stone-200 disabled:opacity-50"
+                >
+                  {sendingInvite ? <i className="fas fa-spinner fa-spin mr-2"></i> : null}
+                  {t('send_invite')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default BrewerySettings;

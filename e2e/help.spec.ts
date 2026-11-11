@@ -1,0 +1,54 @@
+import { test, expect } from './fixtures';
+
+test.describe('Help & Manuals', () => {
+  test.beforeEach(async ({ page }) => {
+    // Start by going to the main page
+    await page.goto('/');
+
+    // Wait for the app to load
+    await page.waitForLoadState('networkidle');
+
+    // Guest users might see the 'Connection Details' modal, dismiss it if it exists
+    // We wait for it to potentially appear
+    const closeBtn = page.getByRole('button', { name: /close/i }).last();
+    try {
+      await expect(closeBtn).toBeVisible({ timeout: 5000 });
+      await closeBtn.click();
+      await expect(closeBtn).not.toBeVisible();
+    } catch (e) {
+      // Modal didn't show up, which is fine
+    }
+
+    // Navigate to Help view via Topbar help icon
+    // Using title attribute for better reliability
+    const topbarHelpBtn = page.getByRole('button', { name: /help/i });
+
+    await expect(topbarHelpBtn).toBeVisible({ timeout: 10000 });
+    await topbarHelpBtn.click();
+  });
+
+  test('should display the manual link with correct attributes', async ({ page }) => {
+    // Check if Help & Manuals title is visible in the view content (the larger h2)
+    const viewTitle = page.locator('main h2').getByText(/help & (manuals|handleidingen|manuels)/i);
+    await expect(viewTitle).toBeVisible();
+
+    // Look for the manual link
+    const manualLink = page.locator('a[href^="/manual.html"]');
+
+    await expect(manualLink).toBeVisible();
+    await expect(manualLink).toHaveAttribute('target', '_blank');
+    await expect(manualLink).toHaveAttribute('rel', /noopener/);
+
+    // Check for translated text (one of them should be present)
+    const linkText = await manualLink.innerText();
+    expect(linkText).toMatch(/open full manual|volledige handleiding openen|ouvrir le manuel complet/i);
+  });
+
+  test('should open the manual in the language of the app', async ({ page }) => {
+    const manualLink = page.locator('a[href^="/manual.html"]');
+    const linkText = (await manualLink.innerText()).toLowerCase();
+    const lang = linkText.includes('volledige') ? 'nl' : linkText.includes('ouvrir') ? 'fr' : 'en';
+    await expect(manualLink).toHaveAttribute('href', `/manual.html?lang=${lang}`);
+    await expect(manualLink).not.toContainText('(EN)');
+  });
+});

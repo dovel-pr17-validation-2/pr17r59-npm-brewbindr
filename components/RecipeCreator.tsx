@@ -1,0 +1,721 @@
+import React, { useState, useMemo } from 'react';
+import { Recipe, Fermentable, Hop, Culture, LibraryIngredient, MashStep, Misc } from '../types';
+import { GeminiService } from '../services/geminiService';
+import { calculateRecipeStats, resolveEquipment, getSRMColor, formatBrewNumber, formatStockAmount, srmToEbc, formatGravity, buGuRatio, FERMENTABLE_TYPES, normalizeFermentableType, guessFermentableType, DEFAULT_WHIRLPOOL_TEMP_C } from '../services/calculations';
+import { useTranslation } from '../App';
+import { useUser } from '../services/userContext';
+import { canEditRecipe, canManageRecipes } from '../services/permissions';
+import WaterPlanCard from './WaterPlanCard';
+import WaterChemistryCard from './WaterChemistryCard';
+
+interface RecipeCreatorProps {
+  onSave: (recipe: Recipe) => void;
+  onSubmitToPublic?: (recipe: Recipe) => void;
+  onDelete?: (id: string) => void;
+  initialRecipe?: Recipe;
+  library: LibraryIngredient[];
+}
+
+const RecipeCreator: React.FC<RecipeCreatorProps> = ({ onSave, onSubmitToPublic, onDelete, initialRecipe, library }) => {
+  const { t, lang } = useTranslation();
+  const { preferences, user, profile, breweryRole, isAdmin } = useUser();
+  const gravityUnit = preferences.gravityUnit ?? 'sg';
+
+  // Same rules as the database: brewery admins/brewmasters manage all brewery recipes
+  const editContext = { userId: user?.id, breweryId: profile?.brewery_id, breweryRole, isAdmin };
+  const canEdit = initialRecipe?.id ? canEditRecipe(initialRecipe, editContext) : canManageRecipes(editContext);
+  const [recipe, setRecipe] = useState<Recipe>(initialRecipe || {
+    name: '',
+    type: 'all_grain',
+    author: '',
+    notes: '',
+    batch_size: { unit: 'liters', value: 20 },
+    ingredients: {
+      fermentables: [],
+      hops: [],
+      cultures: [],
+      miscellaneous: []
+    },
+    efficiency: { brewhouse: 75 },
+    boil_time: { unit: 'minutes', value: 60 },
+    mash: {
+      name: 'Single Infusion',
+      steps: [{ name: 'Mash In', type: 'infusion', step_temp: 67, step_time: 60, infuse_amount: 15 }]
+    }
+  });
+
+  const [prompt, setPrompt] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
+  const gemini = useMemo(() => new GeminiService(), []);
+
+  const handleAiGenerate = async () => {
+    if (!prompt.trim()) return;
+    setIsGenerating(true);
+    try {
+      const generatedRecipe = await gemini.generateRecipe(prompt);
+      if (generatedRecipe && generatedRecipe.name) {
+        setRecipe({
+          ...recipe,
+          ...generatedRecipe,
+          id: recipe.id
+        });
+        setPrompt('');
+      }
+    } catch (error: any) {
+      console.error("AI Generation failed:", error);
+      alert(error?.code === 'AI_DAILY_LIMIT' ? t('ai_daily_limit' as any) : (error?.message || "Failed to generate recipe. Please try again later."));
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // Brewing installation: the one the recipe names, or the brewery's only one
+  const equipmentOptions = useMemo(() => library.filter(l => l.type === 'equipment'), [library]);
+  const equipment = useMemo(() => resolveEquipment(recipe, library), [recipe.equipmentId, library]);
+  const defaultEquipment = useMemo(() => resolveEquipment({}, library), [library]);
+  const stats = useMemo(() => calculateRecipeStats(recipe, undefined, equipment), [recipe, equipment]);
+
+  const handleAiAnalyze = async () => {
+    setIsAnalyzing(true);
+    setAiAnalysis(null);
+    try {
+      const feedback = await gemini.analyzeRecipe(recipe);
+      setAiAnalysis(feedback);
+    } catch (error: any) {
+      console.error("AI Analysis failed:", error);
+      alert(error?.code === 'AI_DAILY_LIMIT' ? t('ai_daily_limit' as any) : (error?.message || "Failed to analyze recipe. Please try again later."));
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+  
+  const libraryMap = useMemo(() => {
+    return new Map(library.map(l => [l.id, l]));
+  }, [library]);
+
+  const libraryByType = useMemo(() => {
+    const grouped = {
+      style: [] as typeof library,
+      fermentable: [] as typeof library,
+      hop: [] as typeof library,
+      culture: [] as typeof library,
+      misc: [] as typeof library,
+      water: [] as typeof library,
+      mash_profile: [] as typeof library,
+      equipment: [] as typeof library,
+    };
+    for (const item of library) {
+      if (item.type in grouped) {
+        grouped[item.type as keyof typeof grouped].push(item);
+      }
+    }
+    return grouped;
+  }, [library]);
+
+  const selectedStyleGuideline = useMemo(() => {
+    if (!recipe.style?.libraryId) return null;
+    return libraryMap.get(recipe.style.libraryId);
+  }, [recipe.style?.libraryId, libraryMap]);
+
+  const checkInRange = (val: number, min?: number, max?: number) => {
+    if (min === undefined || max === undefined) return true;
+    return val >= min && val <= max;
+  };
+
+  const getStatColor = (val: number, min?: number, max?: number) => {
+    if (min === undefined && max === undefined) return 'text-white';
+    return checkInRange(val, min, max) ? 'text-green-500' : 'text-red-500';
+  };
+
+  const addIngredient = (type: 'fermentable' | 'hop' | 'culture' | 'misc') => {
+    setRecipe(prev => {
+      const newIngredients = { ...prev.ingredients };
+      if (type === 'fermentable') {
+        newIngredients.fermentables = [...prev.ingredients.fermentables, { name: '', type: 'grain', amount: { unit: preferences.units === 'imperial' ? 'pounds' : 'kilograms', value: 0 }, color: { value: 2 } }];
+      } else if (type === 'hop') {
+        newIngredients.hops = [...prev.ingredients.hops, { name: '', amount: { unit: preferences.units === 'imperial' ? 'ounces' : 'grams', value: 0 }, use: 'boil', time: { unit: 'minutes', value: 60 }, alpha_acid: { value: 5 } }];
+      } else if (type === 'culture') {
+        newIngredients.cultures = [...prev.ingredients.cultures, { name: '', type: 'ale', form: 'dry', attenuation: 75 }];
+      } else if (type === 'misc') {
+        newIngredients.miscellaneous = [...(prev.ingredients.miscellaneous || []), { name: '', type: 'spice', use: 'boil', amount: { unit: 'grams', value: 0 }, time: { unit: 'minutes', value: 10 } }];
+      }
+      return { ...prev, ingredients: newIngredients };
+    });
+  };
+
+  const handleLibrarySelect = (type: 'fermentable' | 'hop' | 'culture' | 'misc' | 'style' | 'mash_profile', idx: number, libId: string) => {
+    const item = libraryMap.get(libId);
+    if (!item) return;
+
+    setRecipe(prev => {
+      if (type === 'style') return { ...prev, style: { name: item.name, category: item.category, libraryId: item.id } };
+      if (type === 'mash_profile') return { ...prev, mash: { name: item.name, steps: item.steps ? item.steps.map(s => ({ ...s })) : [] } };
+      
+      const newIngredients = { ...prev.ingredients };
+      if (type === 'fermentable') {
+        const list = [...prev.ingredients.fermentables];
+        const potential = 1 + (item.yield || 75) / 100 * 0.046; 
+        list[idx] = { ...list[idx], name: item.name, libraryId: item.id, type: guessFermentableType(item.name), color: { value: item.color || 2 }, yield: { potential: { value: potential } } };
+        newIngredients.fermentables = list;
+      } else if (type === 'hop') {
+        const list = [...prev.ingredients.hops];
+        const form = item.form === 'leaf' || item.form === 'plug' || item.form === 'pellet' ? item.form : list[idx].form;
+        list[idx] = { ...list[idx], name: item.name, libraryId: item.id, alpha_acid: { value: item.alpha || 5 }, form };
+        newIngredients.hops = list;
+      } else if (type === 'culture') {
+        const list = [...prev.ingredients.cultures];
+        list[idx] = { ...list[idx], name: item.name, libraryId: item.id, type: item.type as any, form: item.form as any, attenuation: item.attenuation || 75 };
+        newIngredients.cultures = list;
+      } else if (type === 'misc') {
+        const list = [...(prev.ingredients.miscellaneous || [])];
+        list[idx] = { ...list[idx], name: item.name, libraryId: item.id, type: item.misc_type || 'spice', use: item.misc_use || 'boil' };
+        newIngredients.miscellaneous = list;
+      }
+      return { ...prev, ingredients: newIngredients };
+    });
+  };
+
+  const updateField = (type: 'fermentable' | 'hop' | 'culture' | 'misc', idx: number, field: string, val: any) => {
+    setRecipe(prev => {
+      const newIngredients = { ...prev.ingredients };
+      if (type === 'fermentable') {
+        const list = [...prev.ingredients.fermentables];
+        if (field === 'amount') list[idx] = { ...list[idx], amount: { ...list[idx].amount, value: val } };
+        else list[idx] = { ...list[idx], [field]: val };
+        newIngredients.fermentables = list;
+      } else if (type === 'hop') {
+        const list = [...prev.ingredients.hops];
+        if (field === 'amount') list[idx] = { ...list[idx], amount: { ...list[idx].amount, value: val } };
+        else if (field === 'time') list[idx] = { ...list[idx], time: { ...list[idx].time, value: val } };
+        else if (field === 'use') {
+          // Dry hops are counted in days, everything else in minutes
+          const wasDry = list[idx].use === 'dry_hop';
+          const isDry = val === 'dry_hop';
+          const time = wasDry === isDry ? list[idx].time : { unit: isDry ? 'days' as const : 'minutes' as const, value: isDry ? 3 : val === 'whirlpool' ? 20 : 60 };
+          list[idx] = { ...list[idx], use: val, time };
+        }
+        else list[idx] = { ...list[idx], [field]: val };
+        newIngredients.hops = list;
+      } else if (type === 'culture') {
+        const list = [...prev.ingredients.cultures];
+        list[idx] = { ...list[idx], [field]: val };
+        newIngredients.cultures = list;
+      } else if (type === 'misc') {
+        const list = [...(prev.ingredients.miscellaneous || [])];
+        if (field === 'amount') list[idx] = { ...list[idx], amount: { ...list[idx].amount, value: val } };
+        else if (field === 'time') list[idx] = { ...list[idx], time: { ...list[idx].time, value: val } };
+        else list[idx] = { ...list[idx], [field]: val };
+        newIngredients.miscellaneous = list;
+      }
+      return { ...prev, ingredients: newIngredients };
+    });
+  };
+
+  const removeIngredient = (type: any, index: number) => {
+    setRecipe(prev => {
+      const newIngredients = { ...prev.ingredients };
+      if (type === 'fermentable') newIngredients.fermentables = prev.ingredients.fermentables.filter((_, i) => i !== index);
+      else if (type === 'hop') newIngredients.hops = prev.ingredients.hops.filter((_, i) => i !== index);
+      else if (type === 'culture') newIngredients.cultures = prev.ingredients.cultures.filter((_, i) => i !== index);
+      else if (type === 'misc') newIngredients.miscellaneous = prev.ingredients.miscellaneous?.filter((_, i) => i !== index);
+      return { ...prev, ingredients: newIngredients };
+    });
+  };
+
+  const addMashStep = () => {
+    setRecipe(prev => ({
+      ...prev,
+      mash: {
+        ...prev.mash || { name: 'Custom Mash', steps: [] },
+        steps: [...(prev.mash?.steps || []), { name: 'New Step', type: 'infusion', step_temp: 67, step_time: 60 }]
+      }
+    }));
+  };
+
+  const removeMashStep = (idx: number) => {
+    setRecipe(prev => ({
+      ...prev,
+      mash: prev.mash ? { ...prev.mash, steps: prev.mash.steps.filter((_, i) => i !== idx) } : undefined
+    }));
+  };
+
+  const updateMashStep = (idx: number, field: keyof MashStep, val: any) => {
+    setRecipe(prev => {
+      if (!prev.mash) return prev;
+      const steps = [...prev.mash.steps];
+      steps[idx] = { ...steps[idx], [field]: val };
+      return { ...prev, mash: { ...prev.mash, steps } };
+    });
+  };
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      {/* AI Bot Section */}
+      <section className="bg-gradient-to-br from-indigo-900 to-stone-900 p-8 rounded-3xl shadow-2xl border border-indigo-500/30 relative overflow-hidden group">
+        <div className="absolute top-0 right-0 w-64 h-64 bg-amber-500/10 rounded-full -mr-20 -mt-20 blur-3xl group-hover:bg-amber-500/20 transition-all duration-700"></div>
+        <div className="relative z-10">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div className="bg-amber-500 p-2.5 rounded-xl shadow-lg shadow-amber-500/20 animate-pulse">
+                <i className="fas fa-robot text-white text-xl"></i>
+              </div>
+              <div>
+                <h2 className="text-2xl font-black text-white tracking-tight uppercase">brewbindr <span className="text-amber-500">AI</span></h2>
+                <p className="text-[10px] font-black text-indigo-300 uppercase tracking-widest">{t('recipe_bot_title')}</p>
+              </div>
+            </div>
+            {recipe.id && (
+              <button
+                onClick={handleAiAnalyze}
+                disabled={isAnalyzing}
+                className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-2 shadow-lg"
+              >
+                {isAnalyzing ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-microscope"></i>}
+                {isAnalyzing ? t('analyzing_recipe') : t('analyze_recipe')}
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-col md:flex-row gap-4">
+            <input 
+              aria-label={t('ai_prompt_label')}
+              className="flex-1 bg-white/10 border border-white/20 rounded-2xl px-6 py-4 text-white font-medium placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-amber-500/50 transition-all"
+              placeholder={t('ai_prompt_placeholder')}
+              value={prompt}
+              onChange={e => setPrompt(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleAiGenerate()}
+              maxLength={2000}
+            />
+            <button 
+              onClick={handleAiGenerate}
+              disabled={isGenerating || !prompt.trim()}
+              className="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:hover:bg-amber-600 text-white px-8 py-4 rounded-2xl font-black transition-all shadow-xl shadow-amber-900/40 flex items-center justify-center gap-3 min-w-[200px]"
+            >
+              {isGenerating ? <><i className="fas fa-circle-notch fa-spin" aria-hidden="true"></i> {t('generating_recipe')}</> : <><i className="fas fa-magic" aria-hidden="true"></i> {t('generate_recipe')}</>}
+            </button>
+          </div>
+
+          {aiAnalysis && (
+            <div className="mt-8 bg-white/5 border border-white/10 rounded-2xl p-6 text-white animate-in slide-in-from-top-4 duration-500">
+              <div className="flex items-center gap-2 mb-4 text-amber-400">
+                <i className="fas fa-award text-xl"></i>
+                <h3 className="font-black uppercase tracking-widest text-sm">{t('cicerone_analysis')}</h3>
+              </div>
+              <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap text-stone-200">
+                {aiAnalysis}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Target Stats Section */}
+      <section className="bg-stone-900 text-white p-8 rounded-3xl shadow-xl grid grid-cols-2 lg:grid-cols-4 gap-8 sticky top-24 z-40 border border-stone-800">
+        <div className="flex flex-col">
+          <p className="text-[10px] font-black text-stone-500 uppercase tracking-widest mb-1">{t('target_abv')}</p>
+          <p className={`text-4xl font-black ${getStatColor(stats.abv, selectedStyleGuideline?.abv_min, selectedStyleGuideline?.abv_max)}`}>
+            {formatBrewNumber(stats.abv, 'abv', lang)}%
+          </p>
+          {selectedStyleGuideline?.abv_min !== undefined && (
+            <p className="text-[10px] text-stone-500 font-bold mt-1">Range: {selectedStyleGuideline.abv_min}-{selectedStyleGuideline.abv_max}%</p>
+          )}
+        </div>
+        <div className="flex flex-col">
+          <p className="text-[10px] font-black text-stone-500 uppercase tracking-widest mb-1">{t('target_ibu')}</p>
+          <p className={`text-4xl font-black ${getStatColor(stats.ibu, selectedStyleGuideline?.ibu_min, selectedStyleGuideline?.ibu_max)}`}>
+            {stats.ibu}
+          </p>
+          {selectedStyleGuideline?.ibu_min !== undefined && (
+            <p className="text-[10px] text-stone-500 font-bold mt-1">Range: {selectedStyleGuideline.ibu_min}-{selectedStyleGuideline.ibu_max}</p>
+          )}
+          {stats.og > 1 && (
+            <p className="text-[10px] text-stone-400 font-bold mt-1" title={t('bu_gu_hint')}>
+              BU:GU {formatBrewNumber(buGuRatio(stats.ibu, stats.og), 'default', lang)}
+            </p>
+          )}
+        </div>
+        <div className="flex flex-col">
+          <p className="text-[10px] font-black text-stone-500 uppercase tracking-widest mb-1">{t('color')} ({preferences.colorScale.toUpperCase()})</p>
+          <div className="flex items-center gap-3">
+            <p className={`text-4xl font-black ${getStatColor(stats.color, selectedStyleGuideline?.color_min, selectedStyleGuideline?.color_max)}`}>
+              {formatBrewNumber(stats.color, 'color', lang, preferences)}
+            </p>
+            <div className="w-10 h-6 rounded border border-stone-700 shadow-inner" style={{ backgroundColor: getSRMColor(stats.color) }}></div>
+          </div>
+          {selectedStyleGuideline?.color_min !== undefined && (
+            <p className="text-[10px] text-stone-500 font-bold mt-1">
+              Range: {preferences.colorScale === 'ebc' ? Math.round(srmToEbc(selectedStyleGuideline.color_min || 0)) : selectedStyleGuideline.color_min}-{preferences.colorScale === 'ebc' ? Math.round(srmToEbc(selectedStyleGuideline.color_max || 0)) : selectedStyleGuideline.color_max} {preferences.colorScale.toUpperCase()}
+            </p>
+          )}
+        </div>
+        <div className="flex flex-col">
+          <p className="text-[10px] font-black text-stone-500 uppercase tracking-widest mb-1">{t('est_og')}</p>
+          <p className={`text-4xl font-black ${getStatColor(stats.og, selectedStyleGuideline?.og_min, selectedStyleGuideline?.og_max)}`}>
+            {formatGravity(stats.og, lang, gravityUnit === 'plato' ? 'plato' : 'sg')}
+          </p>
+          {gravityUnit === 'both' && <p className="text-[10px] text-stone-400 font-bold mt-1">{formatGravity(stats.og, lang, 'plato')}</p>}
+          {selectedStyleGuideline?.og_min !== undefined && (
+            <p className="text-[10px] text-stone-500 font-bold mt-1">Range: {formatGravity(selectedStyleGuideline.og_min, lang, gravityUnit === 'plato' ? 'plato' : 'sg')} – {formatGravity(selectedStyleGuideline.og_max, lang, gravityUnit === 'plato' ? 'plato' : 'sg')}</p>
+          )}
+        </div>
+      </section>
+
+      {/* Main Form Section */}
+      <section className="bg-white p-8 rounded-3xl border border-stone-200 shadow-sm space-y-10">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+          <div className="md:col-span-2">
+            <label htmlFor="recipe_name" className="text-xs font-bold text-stone-400 uppercase">{t('recipe_name')}</label>
+            <input id="recipe_name" name="name" className="w-full p-3 bg-stone-50 border rounded-xl text-stone-900 font-bold" value={recipe.name} onChange={e => setRecipe({...recipe, name: e.target.value})} maxLength={100} />
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="recipe_style" className="text-xs font-bold text-stone-400 uppercase">{t('style_label')}</label>
+            <select id="recipe_style" name="style" className="w-full p-3 bg-stone-50 border rounded-xl font-bold" value={recipe.style?.libraryId || ""} onChange={e => handleLibrarySelect('style', 0, e.target.value)}>
+              <option value="">-- Choose Style --</option>
+              {libraryByType.style.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="batch_size" className="text-xs font-bold text-stone-400 uppercase">{t('batch_size')}</label>
+            <div className="flex items-center gap-2">
+              <input id="batch_size" name="batch_size" type="number" className="flex-1 p-3 bg-stone-50 border rounded-xl font-bold" value={recipe.batch_size.value} onChange={e => setRecipe({...recipe, batch_size: {...recipe.batch_size, value: parseFloat(e.target.value) || 0}})} />
+              <select
+                id="batch_size_unit"
+                aria-label={t('batch_size_unit')}
+                className="bg-transparent text-xs font-bold text-stone-400 outline-none"
+                value={recipe.batch_size.unit}
+                onChange={e => setRecipe({...recipe, batch_size: {...recipe.batch_size, unit: e.target.value as any}})}
+              >
+                <option value="liters">L</option>
+                <option value="gallons">Gal</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center gap-1.5 mb-1">
+              <label htmlFor="efficiency" className="text-xs font-bold text-stone-400 uppercase">{t('efficiency')}</label>
+              <div className="group relative">
+                <i className="fas fa-info-circle text-[10px] text-stone-300" title={t('efficiency_info')}></i>
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 p-2 bg-stone-800 text-white text-[9px] rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl">
+                  {t('efficiency_help')}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <input id="efficiency" name="efficiency" type="number" className="flex-1 p-3 bg-stone-50 border rounded-xl font-bold border-amber-200/50 focus:border-amber-500 transition-colors" value={recipe.efficiency.brewhouse} onChange={e => setRecipe({...recipe, efficiency: {brewhouse: parseFloat(e.target.value) || 0}})} />
+              <span className="text-xs font-bold text-amber-600">%</span>
+            </div>
+          </div>
+          <div>
+            <label htmlFor="boil_time" className="text-xs font-bold text-stone-400 uppercase">{t('boil_time')}</label>
+            <div className="flex items-center gap-2">
+              <input id="boil_time" name="boil_time" type="number" className="flex-1 p-3 bg-stone-50 border rounded-xl font-bold" value={recipe.boil_time.value} onChange={e => setRecipe({...recipe, boil_time: {...recipe.boil_time, value: parseFloat(e.target.value) || 0}})} />
+              <span className="text-xs font-bold text-stone-400">min</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Ingredients Sections */}
+        <div>
+          <div className="flex justify-between items-center mb-4"><h4 className="font-bold uppercase text-stone-900"><i className="fas fa-seedling text-amber-700"></i> {t('grains')}</h4><button onClick={() => addIngredient('fermentable')} className="text-amber-600 font-bold text-xs uppercase">+ {t('add_ingredient')}</button></div>
+          <div className="space-y-3">
+            {recipe.ingredients.fermentables.map((f, i) => (
+              <div key={i} className="flex flex-wrap gap-3 p-4 bg-stone-50 rounded-2xl border border-stone-100 items-center">
+                <div className="flex-1 min-w-[12rem]">
+                  <label htmlFor={`ferm-select-${i}`} className="sr-only">{t('select_fermentable')}</label>
+                  <select id={`ferm-select-${i}`} className="w-full p-2.5 bg-white border border-stone-200 rounded-xl text-stone-900 text-sm font-medium" value={f.libraryId || ""} onChange={e => handleLibrarySelect('fermentable', i, e.target.value)}>
+                    <option value="">{f.name || '-- Select Malt --'}</option>
+                    {libraryByType.fermentable.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor={`ferm-type-${i}`} className="sr-only">{t('fermentable_type')}</label>
+                  <select id={`ferm-type-${i}`} name={`ferm-type-${i}`} title={t('fermentable_type')} className="p-2 bg-white border border-stone-200 rounded-xl text-[10px] font-black uppercase text-stone-500" value={normalizeFermentableType(f.type)} onChange={e => updateField('fermentable', i, 'type', e.target.value)}>
+                    {FERMENTABLE_TYPES.map(ft => <option key={ft} value={ft}>{t(`ferm_type_${ft}`)}</option>)}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`ferm-amount-${i}`} className="sr-only">{t('amount_label')}</label>
+                  <input id={`ferm-amount-${i}`} className="w-20 p-2 bg-white border rounded-xl text-right font-black" type="number" step="0.001" value={f.amount?.value ?? 0} onChange={e => updateField('fermentable', i, 'amount', parseFloat(e.target.value) || 0)} />
+                  <label htmlFor={`ferm-unit-${i}`} className="sr-only">{t('unit_label')}</label>
+                  <select
+                    id={`ferm-unit-${i}`}
+                    className="bg-transparent text-[10px] font-black text-stone-400 uppercase outline-none"
+                    value={f.amount.unit}
+                    onChange={e => {
+                      const newList = [...recipe.ingredients.fermentables];
+                      newList[i] = { ...newList[i], amount: { ...newList[i].amount, unit: e.target.value as any } };
+                      setRecipe({ ...recipe, ingredients: { ...recipe.ingredients, fermentables: newList } });
+                    }}
+                  >
+                    <option value="kilograms">kg</option>
+                    <option value="pounds">lb</option>
+                  </select>
+                </div>
+                {preferences.enableStockManagement && f.libraryId && libraryMap.get(f.libraryId)?.status === 'private' && libraryMap.get(f.libraryId)?.stock && (
+                  <div className="text-[10px] font-black text-stone-400 uppercase">
+                    {t('stock_label')}: <span className={libraryMap.get(f.libraryId)!.stock!.amount < f.amount.value ? 'text-red-500' : 'text-green-600'}>
+                      {formatStockAmount(libraryMap.get(f.libraryId)!.stock!.amount, libraryMap.get(f.libraryId)!.stock!.unit, lang)} {libraryMap.get(f.libraryId)!.stock!.unit}
+                    </span>
+                  </div>
+                )}
+                <button onClick={() => removeIngredient('fermentable', i)} aria-label={t('remove_fermentable')}><i className="fas fa-trash-alt text-stone-300" aria-hidden="true"></i></button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="flex justify-between items-center mb-4"><h4 className="font-bold uppercase text-stone-900"><i className="fas fa-leaf text-green-700"></i> {t('hops')}</h4><button onClick={() => addIngredient('hop')} className="text-amber-600 font-bold text-xs uppercase">+ {t('add_ingredient')}</button></div>
+          <div className="space-y-3">
+            {recipe.ingredients.hops.map((h, i) => (
+              <div key={i} className="flex flex-wrap gap-3 p-4 bg-stone-50 rounded-2xl border border-stone-100 items-center">
+                <div className="flex-1 min-w-[12rem]">
+                  <label htmlFor={`hop-select-${i}`} className="sr-only">{t('select_hop')}</label>
+                  <select id={`hop-select-${i}`} className="w-full p-2.5 bg-white border border-stone-200 rounded-xl text-stone-900 text-sm font-medium" value={h.libraryId || ""} onChange={e => handleLibrarySelect('hop', i, e.target.value)}>
+                    <option value="">{h.name || '-- Select Hop --'}</option>
+                    {libraryByType.hop.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`hop-use-${i}`} className="sr-only">{t('hop_use')}</label>
+                  <select id={`hop-use-${i}`} name={`hop-use-${i}`} title={t('hop_use')} className="p-2 bg-white border border-stone-200 rounded-xl text-[10px] font-black uppercase text-stone-500" value={(h.use as string) === 'aroma' ? 'whirlpool' : h.use} onChange={e => updateField('hop', i, 'use', e.target.value)}>
+                    {(['boil', 'first_wort', 'mash', 'whirlpool', 'dry_hop'] as const).map(u => <option key={u} value={u}>{t(`hop_use_${u}`)}</option>)}
+                  </select>
+                  <label htmlFor={`hop-form-${i}`} className="sr-only">{t('hop_form')}</label>
+                  <select id={`hop-form-${i}`} name={`hop-form-${i}`} title={t('hop_form')} className="p-2 bg-white border border-stone-200 rounded-xl text-[10px] font-black uppercase text-stone-500" value={h.form || 'pellet'} onChange={e => updateField('hop', i, 'form', e.target.value)}>
+                    {(['pellet', 'leaf', 'plug'] as const).map(f => <option key={f} value={f}>{t(`hop_form_${f}`)}</option>)}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`hop-amount-${i}`} className="sr-only">{t('amount_label')}</label>
+                  <input id={`hop-amount-${i}`} className="w-16 p-2 bg-white border rounded-xl text-right font-black" type="number" value={h.amount?.value ?? 0} onChange={e => updateField('hop', i, 'amount', parseFloat(e.target.value) || 0)} />
+                  <label htmlFor={`hop-unit-${i}`} className="sr-only">{t('unit_label')}</label>
+                  <select
+                    id={`hop-unit-${i}`}
+                    className="bg-transparent text-[10px] font-black text-stone-400 uppercase outline-none"
+                    value={h.amount.unit}
+                    onChange={e => {
+                      const newList = [...recipe.ingredients.hops];
+                      newList[i] = { ...newList[i], amount: { ...newList[i].amount, unit: e.target.value as any } };
+                      setRecipe({ ...recipe, ingredients: { ...recipe.ingredients, hops: newList } });
+                    }}
+                  >
+                    <option value="grams">g</option>
+                    <option value="ounces">oz</option>
+                  </select>
+                </div>
+                {preferences.enableStockManagement && h.libraryId && libraryMap.get(h.libraryId)?.status === 'private' && libraryMap.get(h.libraryId)?.stock && (
+                  <div className="text-[10px] font-black text-stone-400 uppercase">
+                    {t('stock_label')}: <span className={libraryMap.get(h.libraryId)!.stock!.amount < h.amount.value ? 'text-red-500' : 'text-green-600'}>
+                      {formatStockAmount(libraryMap.get(h.libraryId)!.stock!.amount, libraryMap.get(h.libraryId)!.stock!.unit, lang)} {libraryMap.get(h.libraryId)!.stock!.unit}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`hop-time-${i}`} className="sr-only">{t('step_time')}</label>
+                  <input id={`hop-time-${i}`} name={`hop-time-${i}`} className="w-16 p-2 bg-white border rounded-xl text-right font-black" type="number" min="0" max="1000" value={h.time?.value ?? 0} onChange={e => updateField('hop', i, 'time', parseFloat(e.target.value) || 0)} />
+                  <span className="text-[10px] font-black text-stone-400 uppercase">{h.use === 'dry_hop' ? t('days_short') : 'min'}</span>
+                </div>
+                {(h.use === 'whirlpool' || (h.use as string) === 'aroma') && (
+                  <div className="flex items-center gap-2">
+                    <label htmlFor={`hop-temp-${i}`} className="sr-only">{t('whirlpool_temp')}</label>
+                    <input
+                      id={`hop-temp-${i}`}
+                      name={`hop-temp-${i}`}
+                      title={t('whirlpool_temp')}
+                      className="w-16 p-2 bg-white border rounded-xl text-right font-black"
+                      type="number"
+                      min={preferences.units === 'imperial' ? 32 : 0}
+                      max={preferences.units === 'imperial' ? 212 : 100}
+                      value={preferences.units === 'imperial' ? Math.round((h.temperature ?? DEFAULT_WHIRLPOOL_TEMP_C) * 9/5 + 32) : (h.temperature ?? DEFAULT_WHIRLPOOL_TEMP_C)}
+                      onChange={e => {
+                        const val = parseFloat(e.target.value);
+                        if (isNaN(val)) return;
+                        updateField('hop', i, 'temperature', preferences.units === 'imperial' ? Math.round((val - 32) * 5/9 * 10) / 10 : val);
+                      }}
+                    />
+                    <span className="text-[10px] font-black text-stone-400 uppercase">°{preferences.units === 'imperial' ? 'F' : 'C'}</span>
+                  </div>
+                )}
+                <button onClick={() => removeIngredient('hop', i)} aria-label={t('remove_hop')}><i className="fas fa-trash-alt text-stone-300" aria-hidden="true"></i></button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="flex justify-between items-center mb-4"><h4 className="font-bold uppercase text-stone-900"><i className="fas fa-flask text-purple-700"></i> {t('yeast_lib')}</h4><button onClick={() => addIngredient('culture')} className="text-amber-600 font-bold text-xs uppercase">+ {t('add_ingredient')}</button></div>
+          <div className="space-y-3">
+            {recipe.ingredients.cultures.map((c, i) => (
+              <div key={i} className="flex gap-3 p-4 bg-stone-50 rounded-2xl border border-stone-100 items-center">
+                <div className="flex-1">
+                  <label htmlFor={`culture-select-${i}`} className="sr-only">{t('select_yeast')}</label>
+                  <select id={`culture-select-${i}`} className="flex-1 p-2.5 bg-white border border-stone-200 rounded-xl text-stone-900 text-sm font-medium" value={c.libraryId || ""} onChange={e => handleLibrarySelect('culture', i, e.target.value)}>
+                    <option value="">{c.name || '-- Select Yeast --'}</option>
+                    {libraryByType.culture.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`culture-att-${i}`} className="sr-only">{t('attenuation_pct')}</label>
+                  <input id={`culture-att-${i}`} className="w-16 p-2 bg-white border rounded-xl text-right font-black" type="number" value={c.attenuation ?? 75} onChange={e => updateField('culture', i, 'attenuation', parseFloat(e.target.value) || 0)} />
+                  <span className="text-[10px] font-black text-stone-400 uppercase">%</span>
+                </div>
+                {preferences.enableStockManagement && c.libraryId && libraryMap.get(c.libraryId)?.status === 'private' && libraryMap.get(c.libraryId)?.stock && (
+                  <div className="text-[10px] font-black text-stone-400 uppercase">
+                    {t('stock_label')}: <span className={libraryMap.get(c.libraryId)!.stock!.amount < 1 ? 'text-red-500' : 'text-green-600'}>
+                      {formatStockAmount(libraryMap.get(c.libraryId)!.stock!.amount, libraryMap.get(c.libraryId)!.stock!.unit, lang)} {libraryMap.get(c.libraryId)!.stock!.unit}
+                    </span>
+                  </div>
+                )}
+                <button onClick={() => removeIngredient('culture', i)} aria-label={t('remove_yeast')}><i className="fas fa-trash-alt text-stone-300" aria-hidden="true"></i></button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Mash Profile Editor */}
+        <div className="pt-6 border-t border-stone-100">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+            <h4 className="font-bold uppercase text-stone-900 flex items-center gap-2"><i className="fas fa-thermometer-half text-red-600"></i> {t('mash_profile')}</h4>
+            <div className="flex flex-wrap gap-3">
+              <label htmlFor="load_mash_profile" className="sr-only">{t('load_mash_profile')}</label>
+              <select id="load_mash_profile" className="px-3 py-2 bg-stone-50 border border-stone-200 rounded-xl text-[10px] font-black uppercase tracking-wider text-stone-600" value="" onChange={e => handleLibrarySelect('mash_profile', 0, e.target.value)}>
+                <option value="">{t('load_from_library')}</option>
+                {libraryByType.mash_profile.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+              </select>
+              <button onClick={addMashStep} className="bg-stone-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-black transition-all">+ {t('add_mash_step')}</button>
+            </div>
+          </div>
+          <div className="space-y-4 bg-stone-50 p-6 rounded-3xl border border-stone-100">
+            <div className="mb-4">
+               <label htmlFor="mash_profile_name" className="text-[10px] font-black text-stone-400 uppercase mb-1 block">{t('profile_name')}</label>
+               <input id="mash_profile_name" name="mash_name" className="w-full p-3 bg-white border border-stone-200 rounded-xl text-sm font-bold shadow-sm" value={recipe.mash?.name || ""} onChange={e => setRecipe({...recipe, mash: { ...(recipe.mash || { steps: [] }), name: e.target.value}})} placeholder={t('profile_name_placeholder')} maxLength={100} />
+            </div>
+            <div className="space-y-3">
+              {(recipe.mash?.steps || []).map((s, idx) => (
+                <div key={idx} className="bg-white p-5 rounded-2xl border border-stone-200 shadow-sm relative group">
+                  <div className="grid grid-cols-1 md:grid-cols-5 gap-6 items-end">
+                    <div className="md:col-span-2">
+                      <label htmlFor={`step_name_${idx}`} className="text-[10px] font-black text-stone-400 uppercase mb-1 block">{t('step_name')}</label>
+                      <input id={`step_name_${idx}`} name={`step_name_${idx}`} className="w-full p-2.5 bg-stone-50 border border-stone-100 rounded-lg text-xs font-bold" value={s.name} onChange={e => updateMashStep(idx, 'name', e.target.value)} maxLength={100} />
+                    </div>
+                    <div>
+                      <label htmlFor={`step_temp_${idx}`} className="text-[10px] font-black text-stone-400 uppercase mb-1 block">{t('step_temp')}</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          id={`step_temp_${idx}`}
+                          name={`step_temp_${idx}`}
+                          type="number"
+                          className="flex-1 p-2.5 bg-stone-50 border border-stone-100 rounded-lg text-xs font-bold"
+                          value={preferences.units === 'imperial' ? Math.round(((s.step_temp || 0) * 9/5) + 32) : (s.step_temp || 0)}
+                          onChange={e => {
+                            const val = parseFloat(e.target.value) || 0;
+                            const celsius = preferences.units === 'imperial' ? (val - 32) * 5/9 : val;
+                            updateMashStep(idx, 'step_temp', celsius);
+                          }}
+                        />
+                        <span className="text-xs font-bold text-stone-400">°{preferences.units === 'imperial' ? 'F' : 'C'}</span>
+                      </div>
+                    </div>
+                    <div>
+                      <label htmlFor={`step_time_${idx}`} className="text-[10px] font-black text-stone-400 uppercase mb-1 block">{t('step_time')}</label>
+                      <div className="flex items-center gap-2">
+                        <input id={`step_time_${idx}`} name={`step_time_${idx}`} type="number" className="flex-1 p-2.5 bg-stone-50 border border-stone-100 rounded-lg text-xs font-bold" value={s.step_time || 0} onChange={e => updateMashStep(idx, 'step_time', parseFloat(e.target.value) || 0)} />
+                        <span className="text-xs font-bold text-stone-400">min</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between pb-1">
+                      <select id={`step_type_${idx}`} aria-label={t('mash_step_type')} className="p-2 bg-stone-100 border border-stone-200 rounded-lg text-[10px] font-black uppercase tracking-tight text-stone-500" value={s.type} onChange={e => updateMashStep(idx, 'type', e.target.value as any)}>
+                        <option value="infusion">{t('step_infusion')}</option>
+                        <option value="temperature">{t('step_temperature')}</option>
+                        <option value="decoction">{t('step_decoction')}</option>
+                      </select>
+                      <button onClick={() => removeMashStep(idx)} className="text-stone-300 hover:text-red-500 transition-colors p-2" aria-label={t('remove_mash_step')}><i className="fas fa-trash-alt" aria-hidden="true"></i></button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Water volumes and strike temperature */}
+        <div className="pt-6 border-t border-stone-100">
+          <WaterPlanCard
+            recipe={recipe}
+            equipment={equipment}
+            og={stats.plannedOg}
+            equipmentOptions={equipmentOptions}
+            defaultEquipment={defaultEquipment}
+            onEquipmentChange={equipmentId => setRecipe(prev => ({ ...prev, equipmentId }))}
+            onWaterChange={water => setRecipe(prev => ({ ...prev, water }))}
+          />
+          <div className="mt-4">
+            <WaterChemistryCard
+              recipe={recipe}
+              library={library}
+              equipment={equipment}
+              onChange={water_chem => setRecipe(prev => ({ ...prev, water_chem }))}
+            />
+          </div>
+        </div>
+
+        {/* Recipe Notes */}
+        <div className="pt-6 border-t border-stone-100">
+          <label htmlFor="recipe_notes" className="font-bold uppercase text-stone-900 mb-4 flex items-center gap-2"><i className="fas fa-sticky-note text-stone-400"></i> {t('notes')}</label>
+          <textarea 
+            id="recipe_notes"
+            name="notes"
+            className="w-full p-4 bg-stone-50 border border-stone-100 rounded-2xl min-h-[120px] text-sm font-medium focus:ring-2 focus:ring-amber-500/20 outline-none transition-all"
+            placeholder={t('recipe_notes_placeholder')}
+            value={recipe.notes || ""}
+            onChange={e => setRecipe({...recipe, notes: e.target.value})}
+            maxLength={2000}
+          />
+        </div>
+
+        <div className="flex flex-col gap-4">
+          <div className="flex gap-4">
+            {onDelete && recipe.id && canEdit && (
+              <button
+                onClick={() => onDelete(recipe.id!)}
+                className="flex-none bg-stone-100 text-red-600 px-8 py-5 rounded-3xl font-black shadow-sm hover:bg-red-50 transition-all uppercase tracking-widest text-lg"
+                aria-label={t('delete_recipe')}
+              >
+                <i className="fas fa-trash-alt"></i>
+              </button>
+            )}
+            <button 
+              disabled={!canEdit}
+              onClick={() => onSave({...recipe, user_id: recipe.user_id || user?.id, specifications: { og: {value: stats.og}, fg: {value: stats.fg}, abv: {value: stats.abv}, ibu: {value: stats.ibu}, color: {value: stats.color}}})}
+              className="flex-1 bg-stone-900 text-white py-5 rounded-3xl font-black shadow-xl hover:bg-black transition-all uppercase tracking-widest text-lg disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {t('save_recipe')}
+            </button>
+          </div>
+
+          {recipe.id && recipe.user_id === user?.id && recipe.status === 'private' && onSubmitToPublic && (
+            <button
+              onClick={() => onSubmitToPublic({...recipe, specifications: { og: {value: stats.og}, fg: {value: stats.fg}, abv: {value: stats.abv}, ibu: {value: stats.ibu}, color: {value: stats.color}}})}
+              className="w-full bg-amber-500 text-white py-4 rounded-2xl font-black shadow-lg hover:bg-amber-600 transition-all uppercase tracking-widest text-sm"
+            >
+              <i className="fas fa-cloud-upload-alt mr-2"></i>
+              {t('submit_to_public')}
+            </button>
+          )}
+
+          {recipe.status === 'approved' && (
+             <div className="p-4 bg-green-50 border border-green-100 rounded-2xl flex items-center gap-3 justify-center">
+                <i className="fas fa-check-circle text-green-500"></i>
+                <span className="text-xs font-bold text-green-800 uppercase tracking-widest">{t('recipe_is_public')}</span>
+             </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+};
+
+export default RecipeCreator;
